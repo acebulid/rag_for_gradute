@@ -1,4 +1,6 @@
 # 多模态RAG系统主API文件
+import sys
+import os
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -6,6 +8,11 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
+
+# 获取项目根目录（rag_for_gradute）
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"))
+# 将根目录加入sys.path
+sys.path.insert(0, PROJECT_ROOT)
 
 from src.api.routers import rag
 from src.api.schemas import HealthCheck, ErrorResponse, SystemStatus
@@ -139,7 +146,9 @@ async def log_requests(request: Request, call_next):
 
 
 # 注册路由
-app.include_router(rag.router)
+app.include_router(rag.router, prefix="/v1")  # 旧版本API
+from src.api.routers.new_rag import router as new_rag_router
+app.include_router(new_rag_router, prefix="/v2")  # 新版本API
 
 
 # 根路由
@@ -238,10 +247,15 @@ async def api_info():
         },
         "technology_stack": {
             "vector_database": "PostgreSQL + pgvector",
-            "embedding_model": "BGE3 (via Ollama)",
-            "vlm_model": "Qwen 2.5 VL (via Ollama)",
-            "llm_model": "Qwen 2.5 (via Ollama)",
-            "framework": "FastAPI + LangChain"
+            "text_embedding": "BGE3 (via Ollama)",
+            "image_embedding": "Qwen3-Max (via DashScope)",
+            "llm_model": "Qwen3-Max (via DashScope)",
+            "relation_model": "KNN (scikit-learn)",
+            "framework": "FastAPI + 新的多模态架构"
+        },
+        "api_versions": {
+            "v1": "旧版多模态RAG API",
+            "v2": "新版多模态RAG API (推荐)"
         }
     }
 
