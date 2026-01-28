@@ -596,9 +596,14 @@ async def inject_sample_data(vector_store: PostgreSQLVectorStore) -> Dict[str, A
                 "chapter_id": chapter.get("id", "")
             }
             
-            # 生成简单的向量（这里使用随机向量，实际应用中应该使用模型生成）
-            import random
-            embedding = [random.uniform(-1, 1) for _ in range(vector_store.embedding_dimension)]
+            # 使用api_function生成真正的BGE向量（与查询时使用相同的模型）
+            from function.api_function import generate_embedding
+            embedding = await generate_embedding(chapter_title)
+            
+            if not embedding:
+                print(f"  警告: 章节 '{chapter_title}' 向量生成失败，使用随机向量")
+                import random
+                embedding = [random.uniform(-1, 1) for _ in range(vector_store.embedding_dimension)]
             
             # 插入文档
             doc_id = await vector_store.insert_document(
@@ -610,7 +615,7 @@ async def inject_sample_data(vector_store: PostgreSQLVectorStore) -> Dict[str, A
             )
             
             chapter_ids[chapter_title] = doc_id
-            print(f"  章节注入: {chapter_title} (ID: {doc_id})")
+            print(f"  章节注入: {chapter_title} (ID: {doc_id}, 向量维度: {len(embedding)})")
             
             # 注入图片数据
             for image_ref in image_refs:
@@ -621,8 +626,14 @@ async def inject_sample_data(vector_store: PostgreSQLVectorStore) -> Dict[str, A
                     "category": "chapter_image"
                 }
                 
-                # 生成图片向量
-                image_embedding = [random.uniform(-1, 1) for _ in range(vector_store.embedding_dimension)]
+                # 生成图片向量（使用图片描述）
+                image_description = f"校园导览图片: {image_ref}"
+                image_embedding = await generate_embedding(image_description)
+                
+                if not image_embedding:
+                    print(f"    警告: 图片 '{image_ref}' 向量生成失败，使用随机向量")
+                    import random
+                    image_embedding = [random.uniform(-1, 1) for _ in range(vector_store.embedding_dimension)]
                 
                 # 插入图片
                 image_id = await vector_store.insert_image(
@@ -643,7 +654,7 @@ async def inject_sample_data(vector_store: PostgreSQLVectorStore) -> Dict[str, A
                     metadata={"source": "sample_data"}
                 )
                 
-                print(f"    图片注入: {image_ref} (关联: {relation_id})")
+                print(f"    图片注入: {image_ref} (关联: {relation_id}, 向量维度: {len(image_embedding)})")
         
         # 统计结果
         doc_count = await vector_store.get_document_count()
@@ -1064,6 +1075,32 @@ async def batch_verify_data_quality(
             "similarity_range": check_similarity_range
         }
     }
+
+
+async def print_database_vectors(vector_store: PostgreSQLVectorStore, limit: int = 5):
+    """
+    打印数据库中的向量信息（调试用）
+    """
+    print(f"[调试] 数据库向量信息 (显示前{limit}个):")
+    
+    try:
+        # 查询数据库中的文档向量
+        async with vector_store.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, doc_metadata->>'title' as title, 
+                       array_length(string_to_array(embedding::text, ','), 1) as vector_dim,
+                       substring(embedding::text from 1 for 100) as vector_preview
+                FROM documents 
+                LIMIT $1
+            """, limit)
+            
+            for i, row in enumerate(rows, 1):
+                print(f"  文档{i}: ID={row['id']}, 标题='{row['title']}'")
+                print(f"    向量维度: {row['vector_dim']}")
+                print(f"    向量预览: {row['vector_preview']}...")
+                
+    except Exception as e:
+        print(f"[调试] 获取数据库向量失败: {e}")
 
 
 async def business_usage_example():

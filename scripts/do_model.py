@@ -54,13 +54,19 @@ def main():
     print("=" * 70)
     
     # 1. 创建模型配置
+    # 确保model文件夹存在
+    model_dir = Path("model")
+    model_dir.mkdir(exist_ok=True)
+    
     config = ModelAConfig(
         input_dim=512,          
         output_dim=1024,        
         epochs=5,               
         batch_size=8,           
         print_every_n_epochs=1,
-        model_path="data/models/demo_model_a.pth"
+        model_path="model/model_a.pth",
+        config_path="model/model_a_config.json",
+        scaler_path="model/model_a_scaler.pkl"
     )
     
     # 2. 创建示例数据（演示用）
@@ -93,6 +99,32 @@ def main():
     try:
         save_model(model, scaler, config)
         print(f"   模型已保存: {config.model_path}")
+        
+        # 同时保存配置文件和scaler
+        config_path = "model/model_a_config.json"
+        scaler_path = "model/model_a_scaler.pkl"
+        
+        # 保存配置
+        import json
+        config_dict = {
+            "input_dim": config.input_dim,
+            "output_dim": config.output_dim,
+            "hidden_dims": config.hidden_dims,
+            "learning_rate": config.learning_rate,
+            "epochs": config.epochs,
+            "batch_size": config.batch_size,
+            "model_path": config.model_path
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config_dict, f, indent=2)
+        print(f"   配置文件已保存: {config_path}")
+        
+        # 保存scaler
+        import pickle
+        with open(scaler_path, 'wb') as f:
+            pickle.dump(scaler, f)
+        print(f"   Scaler已保存: {scaler_path}")
+        
     except Exception as e:
         print(f"   保存失败: {e}")
     
