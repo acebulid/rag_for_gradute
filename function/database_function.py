@@ -29,9 +29,13 @@ def get_database_url():
     
     return f"postgresql://{user}:{password}@{host}:{port}/{db}"
 
-def get_embedding_dimension():
-    """从环境变量获取向量维度"""
-    return int(os.getenv('EMBEDDING_DIMENSION', '1024'))
+def get_text_embedding_dimension():
+    """获取文本向量维度"""
+    return int(os.getenv('TEXT_EMBEDDING_DIMENSION', '1024'))
+
+def get_image_embedding_dimension():
+    """获取图片向量维度"""
+    return int(os.getenv('IMAGE_EMBEDDING_DIMENSION', '512'))
 
 
 # ========== 数据结构定义 ==========
@@ -62,7 +66,8 @@ class PostgreSQLVectorStore:
     def __init__(self, connection_string: Optional[str] = None):
         self.connection_string = connection_string or get_database_url()
         self.pool: Optional[asyncpg.Pool] = None
-        self.embedding_dimension = get_embedding_dimension()
+        self.text_embedding_dimension = get_text_embedding_dimension()
+        self.image_embedding_dimension = get_image_embedding_dimension()
     
     async def connect(self):
         """创建连接池"""
@@ -82,10 +87,18 @@ class PostgreSQLVectorStore:
             self.pool = None
             logger.info("PostgreSQL connection pool closed")
     
-    async def _vector_to_str(self, vector: List[float]) -> str:
-        """将向量转换为pgvector字符串格式"""
-        if len(vector) != self.embedding_dimension:
-            logger.warning(f"Vector dimension mismatch: expected {self.embedding_dimension}, got {len(vector)}")
+    async def _vector_to_str(self, vector: List[float], expected_dim: int) -> Optional[str]:
+        """
+        将向量转换为pgvector字符串格式（支持指定预期维度）
+        :param vector: 待转换向量
+        :param expected_dim: 预期向量维度
+        :return: pgvector格式字符串，维度不匹配时返回None
+        """
+        if len(vector) != expected_dim:
+            logger.error(
+                f"向量维度不匹配：预期{expected_dim}维，实际{len(vector)}维！此向量插入数据库会失败"
+            )
+            return None  # 新增：返回None，提前阻断后续插入操作
         
         return f"[{','.join(map(str, vector))}]"
     
@@ -99,29 +112,37 @@ class PostgreSQLVectorStore:
         return [float(x) for x in vector_str.split(",")]
     
     async def create_tables(self):
-        """创建数据库表"""
+        """创建数据库表（使用动态向量维度）"""
+        if not self.pool:
+            raise RuntimeError("请先调用connect()创建数据库连接池")  # 新增这行
         async with self.pool.acquire() as conn:
-            # 创建文档表
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS documents (
+            # 先删除旧表（如果存在）
+            await conn.execute("DROP TABLE IF EXISTS text_image_relations CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS query_history CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS image_descriptions CASCADE")
+            await conn.execute("DROP TABLE IF EXISTS documents CASCADE")
+            
+            # 创建文档表（使用文本向量维度）
+            await conn.execute(f"""
+                CREATE TABLE documents (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     content TEXT NOT NULL,
-                    doc_metadata JSONB NOT NULL DEFAULT '{}',
-                    embedding vector(1024) NOT NULL,
+                    doc_metadata JSONB NOT NULL DEFAULT '{{}}',
+                    embedding vector({self.text_embedding_dimension}) NOT NULL,
                     source TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
-            # 创建图像描述表
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS image_descriptions (
+            # 创建图像描述表（使用图片向量维度）
+            await conn.execute(f"""
+                CREATE TABLE image_descriptions (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                     image_path TEXT NOT NULL,
                     vlm_description TEXT NOT NULL,
-                    embedding vector(512) NOT NULL,  -- CLIP模型使用512维向量
-                    image_metadata JSONB NOT NULL DEFAULT '{}',
+                    embedding vector({self.image_embedding_dimension}) NOT NULL,
+                    image_metadata JSONB NOT NULL DEFAULT '{{}}',
                     image_size TEXT,
                     file_format TEXT,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
@@ -146,6 +167,7 @@ class PostgreSQLVectorStore:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS query_history (
                     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    session_id TEXT,
                     query_text TEXT,
                     query_image_path TEXT,
                     query_type TEXT NOT NULL,
@@ -175,9 +197,12 @@ class PostgreSQLVectorStore:
     async def insert_document(self, content: str, embedding: List[float], 
                             metadata: Optional[Dict] = None, source: Optional[str] = None,
                             title: Optional[str] = None) -> str:
-        """插入文档"""
+        """插入文档（使用文本向量维度验证）"""
         async with self.pool.acquire() as conn:
-            embedding_str = await self._vector_to_str(embedding)
+            # 传入文本向量维度进行验证和转换（核心修改）
+            embedding_str = await self._vector_to_str(embedding, self.text_embedding_dimension)
+            if embedding_str is None:
+                raise ValueError(f"文档向量维度不匹配：预期{self.text_embedding_dimension}维，实际{len(embedding)}维")
             
             # 构建元数据
             doc_metadata = metadata or {}
@@ -202,7 +227,11 @@ class PostgreSQLVectorStore:
                                      file_format: Optional[str] = None) -> str:
         """插入图像描述"""
         async with self.pool.acquire() as conn:
-            embedding_str = await self._vector_to_str(embedding)
+            # 修复后：传入图像向量维度进行验证和转换
+            embedding_str = await self._vector_to_str(embedding, self.image_embedding_dimension)
+            if embedding_str is None:
+                raise ValueError(f"图像向量维度不匹配：预期{self.image_embedding_dimension}维，实际{len(embedding)}维")
+            
             metadata_json = json.dumps(metadata or {})
             
             result = await conn.fetchrow("""
@@ -219,9 +248,12 @@ class PostgreSQLVectorStore:
     async def insert_image(self, image_path: str, image_embedding: List[float],
                           metadata: Optional[Dict] = None, image_name: Optional[str] = None,
                           chapter_title: Optional[str] = None) -> str:
-        """插入图片向量（直接存储图片编码）"""
+        """插入图片向量（使用图像向量维度验证）"""
         async with self.pool.acquire() as conn:
-            embedding_str = await self._vector_to_str(image_embedding)
+            # 传入图像向量维度进行验证和转换（核心修改）
+            embedding_str = await self._vector_to_str(image_embedding, self.image_embedding_dimension)
+            if embedding_str is None:
+                raise ValueError(f"图片向量维度不匹配：预期{self.image_embedding_dimension}维，实际{len(image_embedding)}维")
             
             # 构建元数据
             image_metadata = metadata or {}
@@ -273,7 +305,10 @@ class PostgreSQLVectorStore:
                                      threshold: float = 0.0) -> List[SearchResult]:
         """搜索相似文档"""
         async with self.pool.acquire() as conn:
-            query_embedding_str = await self._vector_to_str(query_embedding)
+            # 修复：传入文本向量维度进行验证和转换
+            query_embedding_str = await self._vector_to_str(query_embedding, self.text_embedding_dimension)
+            if query_embedding_str is None:
+                raise ValueError(f"查询向量维度不匹配：预期{self.text_embedding_dimension}维，实际{len(query_embedding)}维")
             
             rows = await conn.fetch("""
                 SELECT id, content, doc_metadata as metadata, source,
@@ -302,7 +337,10 @@ class PostgreSQLVectorStore:
                                   threshold: float = 0.0) -> List[ImageSearchResult]:
         """搜索相似图像"""
         async with self.pool.acquire() as conn:
-            query_embedding_str = await self._vector_to_str(query_embedding)
+            # 修复：传入图像向量维度进行验证和转换
+            query_embedding_str = await self._vector_to_str(query_embedding, self.image_embedding_dimension)
+            if query_embedding_str is None:
+                raise ValueError(f"查询向量维度不匹配：预期{self.image_embedding_dimension}维，实际{len(query_embedding)}维")
             
             rows = await conn.fetch("""
                 SELECT id, image_path, vlm_description, image_metadata as metadata,
@@ -382,7 +420,7 @@ class PostgreSQLVectorStore:
         """获取文档相关的图像"""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT i.id, i.image_path, i.vlm_description, i.metadata, r.similarity_score
+                SELECT i.id, i.image_path, i.vlm_description, i.image_metadata as metadata, r.similarity_score
                 FROM text_image_relations r
                 JOIN image_descriptions i ON r.image_id = i.id
                 WHERE r.document_id = $1
@@ -496,17 +534,18 @@ class PostgreSQLVectorStore:
                               retrieved_document_ids: Optional[List[str]] = None,
                               retrieved_image_ids: Optional[List[str]] = None,
                               response: Optional[str] = None,
-                              response_time_ms: Optional[float] = None) -> str:
+                              response_time_ms: Optional[float] = None,
+                              session_id: Optional[str] = None) -> str:
         """记录查询历史"""
         async with self.pool.acquire() as conn:
             result = await conn.fetchrow("""
                 INSERT INTO query_history 
-                (query_text, query_image_path, query_type, 
+                (session_id, query_text, query_image_path, query_type, 
                  retrieved_document_ids, retrieved_image_ids, 
                  response, response_time_ms)
-                VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, $7)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8)
                 RETURNING id
-            """, query_text, query_image_path, query_type,
+            """, session_id, query_text, query_image_path, query_type,
                 json.dumps(retrieved_document_ids or []),
                 json.dumps(retrieved_image_ids or []),
                 response, response_time_ms)
@@ -588,6 +627,12 @@ async def inject_sample_data(vector_store: PostgreSQLVectorStore) -> Dict[str, A
             image_count = chapter.get("image_count", 0)
             image_refs = chapter.get("image_refs", [])
             
+            # 获取章节标题向量（从database_data.json中读取）
+            title_embedding = chapter.get("title_embedding", [])
+            if not title_embedding:
+                print(f"  错误: 章节 '{chapter_title}' 没有标题向量，跳过此章节")
+                continue
+            
             # 创建文档元数据
             metadata = {
                 "title": chapter_title,
@@ -596,26 +641,22 @@ async def inject_sample_data(vector_store: PostgreSQLVectorStore) -> Dict[str, A
                 "chapter_id": chapter.get("id", "")
             }
             
-            # 使用api_function生成真正的BGE向量（与查询时使用相同的模型）
-            from function.api_function import generate_embedding
-            embedding = await generate_embedding(chapter_title)
-            
-            if not embedding:
-                print(f"  警告: 章节 '{chapter_title}' 向量生成失败，使用随机向量")
-                import random
-                embedding = [random.uniform(-1, 1) for _ in range(vector_store.embedding_dimension)]
-            
             # 插入文档
             doc_id = await vector_store.insert_document(
                 content=content_preview,
-                embedding=embedding,
+                embedding=title_embedding,
                 metadata=metadata,
                 source="首都师范大学校园导览",
                 title=chapter_title
             )
             
             chapter_ids[chapter_title] = doc_id
-            print(f"  章节注入: {chapter_title} (ID: {doc_id}, 向量维度: {len(embedding)})")
+            print(f"  章节注入: {chapter_title} (ID: {doc_id}, 向量维度: {len(title_embedding)})")
+            
+            # 获取图片向量（从database_data.json中读取）
+            image_embeddings_data = chapter.get("image_embeddings", [])
+            image_embeddings_map = {img_data.get("image_ref"): img_data.get("embedding") 
+                                   for img_data in image_embeddings_data}
             
             # 注入图片数据
             for image_ref in image_refs:
@@ -626,14 +667,11 @@ async def inject_sample_data(vector_store: PostgreSQLVectorStore) -> Dict[str, A
                     "category": "chapter_image"
                 }
                 
-                # 生成图片向量（使用图片描述）
-                image_description = f"校园导览图片: {image_ref}"
-                image_embedding = await generate_embedding(image_description)
-                
+                # 获取图片向量（从database_data.json中读取）
+                image_embedding = image_embeddings_map.get(image_ref)
                 if not image_embedding:
-                    print(f"    警告: 图片 '{image_ref}' 向量生成失败，使用随机向量")
-                    import random
-                    image_embedding = [random.uniform(-1, 1) for _ in range(vector_store.embedding_dimension)]
+                    print(f"    错误: 图片 '{image_ref}' 没有向量数据，跳过此图片")
+                    continue
                 
                 # 插入图片
                 image_id = await vector_store.insert_image(
@@ -1131,6 +1169,367 @@ async def business_usage_example():
                 print(f"  - 发现问题:")
                 for issue in quality_result['issues_found']:
                     print(f"    * {issue}")
+
+
+# ========== QueryHistory CRUD 函数 ==========
+async def add_dialogue_record(
+    vector_store: PostgreSQLVectorStore,
+    query_text: Optional[str] = None,
+    query_image_path: Optional[str] = None,
+    query_type: str = "text",
+    retrieved_document_ids: Optional[List[str]] = None,
+    retrieved_image_ids: Optional[List[str]] = None,
+    response: Optional[str] = None,
+    response_time_ms: Optional[float] = None,
+    session_id: Optional[str] = None
+) -> str:
+    """
+    添加对话记录到QueryHistory表
+    
+    参数:
+        vector_store: 已连接的向量存储实例
+        query_text: 查询文本
+        query_image_path: 查询图片路径
+        query_type: 查询类型 ("text", "image", "hybrid")
+        retrieved_document_ids: 检索到的文档ID列表
+        retrieved_image_ids: 检索到的图片ID列表
+        response: 系统回复
+        response_time_ms: 响应时间（毫秒）
+        session_id: 会话ID，用于关联多轮对话
+    
+    返回:
+        str: 新记录的ID
+    """
+    try:
+        record_id = await vector_store.log_query_history(
+            query_text=query_text,
+            query_image_path=query_image_path,
+            query_type=query_type,
+            retrieved_document_ids=retrieved_document_ids,
+            retrieved_image_ids=retrieved_image_ids,
+            response=response,
+            response_time_ms=response_time_ms,
+            session_id=session_id
+        )
+        logger.debug(f"对话记录添加成功: {record_id}")
+        return record_id
+    except Exception as e:
+        logger.error(f"添加对话记录失败: {e}")
+        raise
+
+
+async def query_dialogue_records(
+    vector_store: PostgreSQLVectorStore,
+    limit: int = 10,
+    offset: int = 0,
+    query_type: Optional[str] = None,
+    session_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    查询对话记录
+    
+    参数:
+        vector_store: 已连接的向量存储实例
+        limit: 返回记录数量限制
+        offset: 偏移量（用于分页）
+        query_type: 查询类型过滤
+        session_id: 会话ID过滤
+        start_date: 开始日期（格式: 'YYYY-MM-DD'）
+        end_date: 结束日期（格式: 'YYYY-MM-DD'）
+    
+    返回:
+        List[Dict]: 对话记录列表
+    """
+    try:
+        async with vector_store.pool.acquire() as conn:
+            # 构建查询条件
+            conditions = []
+            params = []
+            param_index = 1
+            
+            if query_type:
+                conditions.append(f"query_type = ${param_index}")
+                params.append(query_type)
+                param_index += 1
+            
+            if session_id:
+                conditions.append(f"session_id = ${param_index}")
+                params.append(session_id)
+                param_index += 1
+            
+            if start_date:
+                conditions.append(f"created_at >= ${param_index}::timestamp")
+                params.append(f"{start_date} 00:00:00")
+                param_index += 1
+            
+            if end_date:
+                conditions.append(f"created_at <= ${param_index}::timestamp")
+                params.append(f"{end_date} 23:59:59")
+                param_index += 1
+            
+            where_clause = " AND ".join(conditions) if conditions else "1=1"
+            
+            # 添加分页参数
+            params.append(limit)
+            params.append(offset)
+            
+            query = f"""
+                SELECT id, session_id, query_text, query_image_path, query_type,
+                       retrieved_document_ids, retrieved_image_ids,
+                       response, response_time_ms, created_at
+                FROM query_history
+                WHERE {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ${param_index} OFFSET ${param_index + 1}
+            """
+            
+            rows = await conn.fetch(query, *params)
+            
+            # 转换为字典列表
+            records = []
+            for row in rows:
+                record = {
+                    "id": str(row['id']),
+                    "session_id": row['session_id'],
+                    "query_text": row['query_text'],
+                    "query_image_path": row['query_image_path'],
+                    "query_type": row['query_type'],
+                    "retrieved_document_ids": row['retrieved_document_ids'],
+                    "retrieved_image_ids": row['retrieved_image_ids'],
+                    "response": row['response'],
+                    "response_time_ms": row['response_time_ms'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None
+                }
+                records.append(record)
+            
+            logger.debug(f"查询到 {len(records)} 条对话记录")
+            return records
+            
+    except Exception as e:
+        logger.error(f"查询对话记录失败: {e}")
+        raise
+
+
+async def update_dialogue_record(
+    vector_store: PostgreSQLVectorStore,
+    record_id: str,
+    response: Optional[str] = None,
+    response_time_ms: Optional[float] = None,
+    retrieved_document_ids: Optional[List[str]] = None,
+    retrieved_image_ids: Optional[List[str]] = None,
+    session_id: Optional[str] = None
+) -> bool:
+    """
+    更新对话记录
+    
+    参数:
+        vector_store: 已连接的向量存储实例
+        record_id: 记录ID
+        response: 更新的系统回复
+        response_time_ms: 更新的响应时间
+        retrieved_document_ids: 更新的检索文档ID列表
+        retrieved_image_ids: 更新的检索图片ID列表
+        session_id: 更新的会话ID
+    
+    返回:
+        bool: 更新是否成功
+    """
+    try:
+        async with vector_store.pool.acquire() as conn:
+            # 构建更新字段
+            updates = []
+            params = []
+            param_index = 1
+            
+            if response is not None:
+                updates.append(f"response = ${param_index}")
+                params.append(response)
+                param_index += 1
+            
+            if response_time_ms is not None:
+                updates.append(f"response_time_ms = ${param_index}")
+                params.append(response_time_ms)
+                param_index += 1
+            
+            if retrieved_document_ids is not None:
+                updates.append(f"retrieved_document_ids = ${param_index}::jsonb")
+                params.append(json.dumps(retrieved_document_ids))
+                param_index += 1
+            
+            if retrieved_image_ids is not None:
+                updates.append(f"retrieved_image_ids = ${param_index}::jsonb")
+                params.append(json.dumps(retrieved_image_ids))
+                param_index += 1
+            
+            if session_id is not None:
+                updates.append(f"session_id = ${param_index}")
+                params.append(session_id)
+                param_index += 1
+            
+            if not updates:
+                logger.warning("没有提供更新字段")
+                return False
+            
+            # 添加记录ID参数
+            params.append(uuid.UUID(record_id))
+            
+            update_clause = ", ".join(updates)
+            query = f"""
+                UPDATE query_history
+                SET {update_clause}
+                WHERE id = ${param_index}
+                RETURNING id
+            """
+            
+            result = await conn.fetchrow(query, *params)
+            
+            if result:
+                logger.debug(f"对话记录更新成功: {record_id}")
+                return True
+            else:
+                logger.warning(f"对话记录不存在: {record_id}")
+                return False
+                
+    except Exception as e:
+        logger.error(f"更新对话记录失败: {e}")
+        raise
+
+
+async def delete_dialogue_record(
+    vector_store: PostgreSQLVectorStore,
+    record_id: str
+) -> bool:
+    """
+    删除对话记录
+    
+    参数:
+        vector_store: 已连接的向量存储实例
+        record_id: 记录ID
+    
+    返回:
+        bool: 删除是否成功
+    """
+    try:
+        async with vector_store.pool.acquire() as conn:
+            result = await conn.fetchrow("""
+                DELETE FROM query_history
+                WHERE id = $1
+                RETURNING id
+            """, uuid.UUID(record_id))
+            
+            if result:
+                logger.debug(f"对话记录删除成功: {record_id}")
+                return True
+            else:
+                logger.warning(f"对话记录不存在: {record_id}")
+                return False
+                
+    except Exception as e:
+        logger.error(f"删除对话记录失败: {e}")
+        raise
+
+
+async def get_dialogue_record_by_id(
+    vector_store: PostgreSQLVectorStore,
+    record_id: str
+) -> Optional[Dict[str, Any]]:
+    """
+    根据ID获取单个对话记录
+    
+    参数:
+        vector_store: 已连接的向量存储实例
+        record_id: 记录ID
+    
+    返回:
+        Optional[Dict]: 对话记录，如果不存在则返回None
+    """
+    try:
+        async with vector_store.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT id, session_id, query_text, query_image_path, query_type,
+                       retrieved_document_ids, retrieved_image_ids,
+                       response, response_time_ms, created_at
+                FROM query_history
+                WHERE id = $1
+            """, uuid.UUID(record_id))
+            
+            if row:
+                record = {
+                    "id": str(row['id']),
+                    "session_id": row['session_id'],
+                    "query_text": row['query_text'],
+                    "query_image_path": row['query_image_path'],
+                    "query_type": row['query_type'],
+                    "retrieved_document_ids": row['retrieved_document_ids'],
+                    "retrieved_image_ids": row['retrieved_image_ids'],
+                    "response": row['response'],
+                    "response_time_ms": row['response_time_ms'],
+                    "created_at": row['created_at'].isoformat() if row['created_at'] else None
+                }
+                return record
+            else:
+                return None
+                
+    except Exception as e:
+        logger.error(f"获取对话记录失败: {e}")
+        raise
+
+
+async def get_dialogue_statistics(
+    vector_store: PostgreSQLVectorStore,
+    days: int = 7
+) -> Dict[str, Any]:
+    """
+    获取对话统计信息
+    
+    参数:
+        vector_store: 已连接的向量存储实例
+        days: 统计最近多少天的数据
+    
+    返回:
+        Dict: 统计信息
+    """
+    try:
+        async with vector_store.pool.acquire() as conn:
+            # 总记录数
+            total_count = await conn.fetchval("SELECT COUNT(*) FROM query_history")
+            
+            # 按类型统计
+            type_stats = await conn.fetch("""
+                SELECT query_type, COUNT(*) as count
+                FROM query_history
+                GROUP BY query_type
+                ORDER BY count DESC
+            """)
+            
+            # 最近N天的记录数
+            recent_count = await conn.fetchval("""
+                SELECT COUNT(*) FROM query_history
+                WHERE created_at >= CURRENT_DATE - INTERVAL '1 day' * $1
+            """, days)
+            
+            # 平均响应时间
+            avg_response_time = await conn.fetchval("""
+                SELECT AVG(response_time_ms) FROM query_history
+                WHERE response_time_ms IS NOT NULL
+            """)
+            
+            return {
+                "total_records": total_count,
+                "recent_records": recent_count,
+                "average_response_time_ms": float(avg_response_time) if avg_response_time else None,
+                "query_type_distribution": [
+                    {"type": row['query_type'], "count": row['count']}
+                    for row in type_stats
+                ],
+                "statistics_period_days": days
+            }
+            
+    except Exception as e:
+        logger.error(f"获取对话统计信息失败: {e}")
+        raise
 
 
 # ========== 全局实例和主函数 ==========

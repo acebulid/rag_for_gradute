@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-模型A（图片编码→含义向量）完整工具集
-整合模型训练、预测、评估、状态修复等所有功能
+模型A（图片编码→关键词分类）完整工具集
+输入：图片向量（维）
+输出：关键词类别（9个类别）
 """
 
 import sys
@@ -23,8 +24,8 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import sklearn
 import warnings
-from sklearn.preprocessing import StandardScaler
-from typing import Optional, Dict, Any
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 # 简化日志配置
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +39,8 @@ try:
         torch.serialization.add_safe_globals([
             sklearn.preprocessing._data.StandardScaler,
             StandardScaler,
-            # 如果还有其他自定义对象，也需要注册在这里
+            sklearn.preprocessing._label.LabelEncoder,
+            LabelEncoder,
         ])
     
     # 2. 全局关闭weights_only默认值（终极方案）
@@ -61,15 +63,15 @@ except Exception as e:
 class ModelAConfig:
     """模型A配置"""
     # 模型架构
-    input_dim: int = 512  # CLIP向量维度
-    hidden_dims: List[int] = (1024, 1024, 1024)  # 隐藏层维度
-    output_dim: int = 1024  # 输出向量维度（与文字向量对齐）
+    input_dim: int = 512  # 图片向量维度（512维）
+    hidden_dims: List[int] = (256, 128, 64)  # 隐藏层维度相应调整
+    num_classes: int = 9  # 9个关键词类别
     
     # 训练参数
     learning_rate: float = 0.001
     batch_size: int = 32
-    epochs: int = 100
-    dropout_rate: float = 0.2
+    epochs: int = 50
+    dropout_rate: float = 0.3
     weight_decay: float = 1e-5
     
     # 数据参数
@@ -77,37 +79,48 @@ class ModelAConfig:
     test_split: float = 0.1
     
     # 保存路径
-    model_path: str = "data/models/model_a.pth"
-    config_path: str = "data/models/model_a_config.json"
-    scaler_path: str = "data/models/model_a_scaler.pkl"
+    model_path: str = "model/model_a.pth"
+    config_path: str = "model/model_a_config.json"
+    scaler_path: str = "model/model_a_scaler.pkl"
+    label_encoder_path: str = "model/model_a_label_encoder.pkl"
     
     # 日志和监控
     print_every_n_epochs: int = 5  # 每N个epoch打印一次训练效果
     save_checkpoints: bool = True  # 是否保存检查点
-    checkpoint_dir: str = "data/models/checkpoints"  # 检查点目录
-
-
-class ImageToMeaningDataset(Dataset):
-    """图片到含义数据集"""
+    checkpoint_dir: str = "model/checkpoints"  # 检查点目录
     
-    def __init__(self, image_embeddings: np.ndarray, text_embeddings: np.ndarray):
+    # 关键词列表（9个章节标题）
+    keywords: List[str] = None
+    
+    def __post_init__(self):
+        if self.keywords is None:
+            self.keywords = [
+                "校门", "校训石", "主楼", "图书馆", 
+                "理科楼", "学生活动中心（补充版）", "操场", "食堂", "大成广场"
+            ]
+
+
+class ImageToKeywordDataset(Dataset):
+    """图片到关键词数据集"""
+    
+    def __init__(self, image_embeddings: np.ndarray, keyword_labels: np.ndarray):
         """
         参数:
             image_embeddings: 图片向量数组 (n_samples, input_dim)
-            text_embeddings: 文字向量数组 (n_samples, output_dim)
+            keyword_labels: 关键词标签数组 (n_samples,)
         """
         self.image_embeddings = torch.FloatTensor(image_embeddings)
-        self.text_embeddings = torch.FloatTensor(text_embeddings)
+        self.keyword_labels = torch.LongTensor(keyword_labels)
         
     def __len__(self):
         return len(self.image_embeddings)
     
     def __getitem__(self, idx):
-        return self.image_embeddings[idx], self.text_embeddings[idx]
+        return self.image_embeddings[idx], self.keyword_labels[idx]
 
 
-class ImageToMeaningModel(nn.Module):
-    """图片到含义模型（全连接神经网络）"""
+class ImageToKeywordModel(nn.Module):
+    """图片到关键词模型（分类神经网络）"""
     
     def __init__(self, config: ModelAConfig):
         super().__init__()
@@ -127,8 +140,8 @@ class ImageToMeaningModel(nn.Module):
             ])
             input_dim = hidden_dim
         
-        # 输出层
-        layers.append(nn.Linear(input_dim, config.output_dim))
+        # 输出层（分类层）
+        layers.append(nn.Linear(input_dim, config.num_classes))
         self.network = nn.Sequential(*layers)
         
         # 初始化权重
@@ -150,9 +163,9 @@ class ImageToMeaningModel(nn.Module):
         return self.network(x)
 
 # ============================ 模型核心功能 ============================
-def create_model_instance(config: ModelAConfig) -> Tuple[ImageToMeaningModel, torch.device]:
+def create_model_instance(config: ModelAConfig) -> Tuple[ImageToKeywordModel, torch.device]:
     """
-    创建模型实例并确定计算设备（统一版本，替换重复定义）
+    创建模型实例并确定计算设备
     
     参数:
         config: 模型配置实例
@@ -161,14 +174,14 @@ def create_model_instance(config: ModelAConfig) -> Tuple[ImageToMeaningModel, to
         tuple: (模型实例, 计算设备)
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = ImageToMeaningModel(config).to(device)
+    model = ImageToKeywordModel(config).to(device)
     logger.info(f"模型初始化完成 - 使用设备: {device}")
     return model, device
 
 
 def prepare_training_data(
     image_embeddings: np.ndarray,
-    text_embeddings: np.ndarray,
+    keyword_labels: np.ndarray,
     config: ModelAConfig,
     random_seed: Optional[int] = None
 ) -> Dict[str, Any]:
@@ -177,7 +190,7 @@ def prepare_training_data(
     
     参数:
         image_embeddings: 图片向量数组
-        text_embeddings: 文字向量数组
+        keyword_labels: 关键词标签数组
         config: 模型配置
         random_seed: 随机种子，可选
     
@@ -205,9 +218,9 @@ def prepare_training_data(
     
     # 创建数据集和加载器
     def create_loader(indices, shuffle: bool = False):
-        dataset = ImageToMeaningDataset(
+        dataset = ImageToKeywordDataset(
             image_embeddings_scaled[indices],
-            text_embeddings[indices]
+            keyword_labels[indices]
         )
         return DataLoader(
             dataset,
@@ -232,47 +245,58 @@ def prepare_training_data(
 
 def train_model(
     image_embeddings: np.ndarray,
-    text_embeddings: np.ndarray,
+    keyword_labels: np.ndarray,
     config: ModelAConfig,
     random_seed: Optional[int] = None,
     verbose: bool = True
-) -> Tuple[ImageToMeaningModel, Dict[str, Any], StandardScaler]:
+) -> Tuple[ImageToKeywordModel, Dict[str, Any], StandardScaler, LabelEncoder]:
     """
-    训练模型A
+    训练模型A（分类模型）
     
     参数:
         image_embeddings: 图片向量数组
-        text_embeddings: 文字向量数组
+        keyword_labels: 关键词标签数组（字符串）
         config: 模型配置
         random_seed: 随机种子
         verbose: 是否打印训练过程
     
     返回:
-        tuple: (模型实例, 训练历史, scaler)
+        tuple: (模型实例, 训练历史, scaler, label_encoder)
     """
     if verbose:
         print("="*70)
-        print("开始训练模型A")
+        print("开始训练模型A（关键词分类）")
         print("="*70)
     
     training_start_time = time.time()
     
-    # 准备数据
-    data_info = prepare_training_data(image_embeddings, text_embeddings, config, random_seed)
+    # 1. 编码关键词标签
+    label_encoder = LabelEncoder()
+    encoded_labels = label_encoder.fit_transform(keyword_labels)
+    
+    if verbose:
+        print(f"关键词类别: {label_encoder.classes_}")
+        print(f"类别数量: {len(label_encoder.classes_)}")
+        print(f"样本数量: {len(image_embeddings)}")
+    
+    # 2. 准备数据
+    data_info = prepare_training_data(image_embeddings, encoded_labels, config, random_seed)
     scaler = data_info['scaler']
     
-    # 初始化模型、损失函数和优化器
+    # 3. 初始化模型、损失函数和优化器
     model, device = create_model_instance(config)
-    criterion = nn.CosineEmbeddingLoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay
     )
     
-    # 训练循环初始化
+    # 4. 训练循环初始化
     best_val_loss = float('inf')
+    best_val_accuracy = 0.0
     train_losses, val_losses = [], []
+    train_accuracies, val_accuracies = [], []
     
     if verbose:
         print(f"\n开始训练循环，共 {config.epochs} 个epoch")
@@ -286,43 +310,61 @@ def train_model(
         # 训练阶段
         model.train()
         train_loss = 0.0
+        train_correct = 0
+        train_total = 0
         
-        for batch_images, batch_texts in data_info['train_loader']:
-            batch_images, batch_texts = batch_images.to(device), batch_texts.to(device)
+        for batch_images, batch_labels in data_info['train_loader']:
+            batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
             
             # 前向传播 + 计算损失 + 反向传播
             outputs = model(batch_images)
-            loss = criterion(outputs, batch_texts, torch.ones(batch_images.size(0)).to(device))
+            loss = criterion(outputs, batch_labels)
             
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             
             train_loss += loss.item() * batch_images.size(0)
+            
+            # 计算准确率
+            _, predicted = torch.max(outputs.data, 1)
+            train_total += batch_labels.size(0)
+            train_correct += (predicted == batch_labels).sum().item()
         
         train_loss /= data_info['n_train']
+        train_accuracy = train_correct / train_total
         train_losses.append(train_loss)
+        train_accuracies.append(train_accuracy)
         
         # 验证阶段
         model.eval()
         val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+        
         with torch.no_grad():
-            for batch_images, batch_texts in data_info['val_loader']:
-                batch_images, batch_texts = batch_images.to(device), batch_texts.to(device)
+            for batch_images, batch_labels in data_info['val_loader']:
+                batch_images, batch_labels = batch_images.to(device), batch_labels.to(device)
                 outputs = model(batch_images)
-                loss = criterion(outputs, batch_texts, torch.ones(batch_images.size(0)).to(device))
+                loss = criterion(outputs, batch_labels)
                 val_loss += loss.item() * batch_images.size(0)
+                
+                # 计算准确率
+                _, predicted = torch.max(outputs.data, 1)
+                val_total += batch_labels.size(0)
+                val_correct += (predicted == batch_labels).sum().item()
         
         val_loss /= data_info['n_val']
+        val_accuracy = val_correct / val_total
         val_losses.append(val_loss)
+        val_accuracies.append(val_accuracy)
         epoch_time = time.time() - epoch_start_time
         
         # 打印训练效果
         if verbose and ((epoch + 1) % config.print_every_n_epochs == 0 or epoch in (0, config.epochs - 1)):
             print(f"\nEpoch {epoch+1}/{config.epochs}")
-            print(f"   训练损失: {train_loss:.6f}")
-            print(f"   验证损失: {val_loss:.6f}")
-            print(f"   训练/验证损失比: {train_loss/val_loss:.4f}")
+            print(f"   训练损失: {train_loss:.6f}, 训练准确率: {train_accuracy:.4f}")
+            print(f"   验证损失: {val_loss:.6f}, 验证准确率: {val_accuracy:.4f}")
             print(f"   Epoch耗时: {epoch_time:.2f}秒")
             
             # 保存检查点
@@ -334,12 +376,13 @@ def train_model(
                 print(f"   检查点已保存: {checkpoint_path}")
         
         # 保存最佳模型
-        if val_loss < best_val_loss:
-            improvement = (best_val_loss - val_loss) / best_val_loss * 100 if best_val_loss != float('inf') else 0
+        if val_accuracy > best_val_accuracy:
+            improvement = (val_accuracy - best_val_accuracy) * 100 if best_val_accuracy > 0 else 0
+            best_val_accuracy = val_accuracy
             best_val_loss = val_loss
             if verbose:
-                print(f"   发现更好模型! 验证损失改善: {improvement:.2f}%")
-            save_model(model, scaler, config, config.model_path)
+                print(f"   发现更好模型! 验证准确率改善: {improvement:.2f}%")
+            save_model(model, scaler, label_encoder, config, config.model_path)
     
     # 训练完成
     total_time = time.time() - training_start_time
@@ -350,8 +393,9 @@ def train_model(
         print("="*70)
         print(f"   总训练时间: {total_time:.2f}秒")
         print(f"   最佳验证损失: {best_val_loss:.6f}")
-        print(f"   最终训练损失: {train_losses[-1]:.6f}")
-        print(f"   最终验证损失: {val_losses[-1]:.6f}")
+        print(f"   最佳验证准确率: {best_val_accuracy:.4f}")
+        print(f"   最终训练准确率: {train_accuracies[-1]:.4f}")
+        print(f"   最终验证准确率: {val_accuracies[-1]:.4f}")
         print(f"   训练样本数: {data_info['n_train']}")
         print(f"   验证样本数: {data_info['n_val']}")
     
@@ -359,16 +403,19 @@ def train_model(
     train_history = {
         'train_losses': train_losses,
         'val_losses': val_losses,
+        'train_accuracies': train_accuracies,
+        'val_accuracies': val_accuracies,
         'best_val_loss': best_val_loss,
+        'best_val_accuracy': best_val_accuracy,
         'training_time': total_time,
         'n_epochs': config.epochs
     }
     
-    return model, train_history, scaler
+    return model, train_history, scaler, label_encoder
 
 
 def save_checkpoint(
-    model: ImageToMeaningModel,
+    model: ImageToKeywordModel,
     path: str,
     epoch: int,
     train_loss: float,
@@ -399,8 +446,9 @@ def save_checkpoint(
 
 
 def save_model(
-    model: ImageToMeaningModel,
+    model: ImageToKeywordModel,
     scaler: StandardScaler,
+    label_encoder: LabelEncoder,
     config: ModelAConfig,
     save_path: Optional[str] = None
 ):
@@ -410,6 +458,7 @@ def save_model(
     参数:
         model: 模型实例
         scaler: 数据标准化器
+        label_encoder: 标签编码器
         config: 模型配置
         save_path: 保存路径，默认使用配置中的路径
     """
@@ -423,6 +472,7 @@ def save_model(
         'model_state_dict': model.state_dict(),
         'config': config.__dict__,
         'scaler': scaler,
+        'label_encoder': label_encoder,
         'is_trained': getattr(model, 'is_trained', True),  # 兼容状态属性
         'device': str(next(model.parameters()).device)
     }, save_path)
@@ -435,12 +485,17 @@ def save_model(
     if scaler:
         with open(config.scaler_path, 'wb') as f:
             pickle.dump(scaler, f)
+    
+    # 保存label_encoder
+    if label_encoder:
+        with open(config.label_encoder_path, 'wb') as f:
+            pickle.dump(label_encoder, f)
 
 
 def load_model(
     config: ModelAConfig,
     model_path: Optional[str] = None
-) -> Tuple[ImageToMeaningModel, StandardScaler, torch.device]:
+) -> Tuple[ImageToKeywordModel, StandardScaler, LabelEncoder, torch.device]:
     """
     加载模型（基础版）
     
@@ -449,7 +504,7 @@ def load_model(
         model_path: 模型路径，默认使用配置中的路径
     
     返回:
-        tuple: (模型实例, scaler, 计算设备)
+        tuple: (模型实例, scaler, label_encoder, 计算设备)
     """
     if model_path is None:
         model_path = config.model_path
@@ -460,7 +515,7 @@ def load_model(
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     
     # 初始化模型
-    model = ImageToMeaningModel(config).to(device)
+    model = ImageToKeywordModel(config).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     
     # 添加训练状态属性
@@ -477,29 +532,41 @@ def load_model(
             with open(config.scaler_path, 'rb') as f:
                 scaler = pickle.load(f)
     
+    # 加载label_encoder
+    label_encoder = None
+    if 'label_encoder' in checkpoint and checkpoint['label_encoder']:
+        label_encoder = checkpoint['label_encoder']
+    else:
+        # 尝试从单独的文件加载label_encoder
+        if os.path.exists(config.label_encoder_path):
+            with open(config.label_encoder_path, 'rb') as f:
+                label_encoder = pickle.load(f)
+    
     logger.info("模型加载完成")
-    return model, scaler, device
+    return model, scaler, label_encoder, device
 
 
 def predict_single(
-    model: ImageToMeaningModel,
+    model: ImageToKeywordModel,
     scaler: StandardScaler,
+    label_encoder: LabelEncoder,
     device: torch.device,
     image_embedding: np.ndarray,
     verbose: bool = True
-) -> np.ndarray:
+) -> Tuple[str, float]:
     """
     单样本预测
     
     参数:
         model: 模型实例
         scaler: 数据标准化器
+        label_encoder: 标签编码器
         device: 计算设备
         image_embedding: 输入图片向量
         verbose: 是否打印预测信息
     
     返回:
-        np.ndarray: 输出含义向量
+        tuple: (关键词, 置信度)
     """
     model.eval()
     
@@ -516,40 +583,48 @@ def predict_single(
         
         # 转换为张量并预测
         image_tensor = torch.FloatTensor(image_embedding).unsqueeze(0).to(device)
-        meaning_vector = model(image_tensor).cpu().numpy()[0]
+        logits = model(image_tensor).cpu().numpy()[0]
+        
+        # 计算softmax概率
+        probabilities = np.exp(logits) / np.sum(np.exp(logits))
+        predicted_class = np.argmax(probabilities)
+        confidence = probabilities[predicted_class]
+        
+        # 解码关键词
+        keyword = label_encoder.inverse_transform([predicted_class])[0]
     
-    # 归一化输出
-    meaning_vector = meaning_vector / np.linalg.norm(meaning_vector)
     inference_time = time.time() - start_time
     
     if verbose:
         print(f"预测完成")
-        print(f"   输出向量维度: {len(meaning_vector)}")
-        print(f"   输出向量范数: {np.linalg.norm(meaning_vector):.4f}")
+        print(f"   预测关键词: {keyword}")
+        print(f"   置信度: {confidence:.4f}")
         print(f"   推理耗时: {inference_time*1000:.2f}ms")
     
-    return meaning_vector
+    return keyword, confidence
 
 
 def batch_predict(
-    model: ImageToMeaningModel,
+    model: ImageToKeywordModel,
     scaler: StandardScaler,
+    label_encoder: LabelEncoder,
     device: torch.device,
     image_embeddings: np.ndarray,
     verbose: bool = True
-) -> np.ndarray:
+) -> List[Tuple[str, float]]:
     """
     批量预测
     
     参数:
         model: 模型实例
         scaler: 数据标准化器
+        label_encoder: 标签编码器
         device: 计算设备
         image_embeddings: 输入图片向量数组
         verbose: 是否打印预测信息
     
     返回:
-        np.ndarray: 输出含义向量数组
+        List[Tuple[str, float]]: 预测结果列表（关键词, 置信度）
     """
     model.eval()
     
@@ -567,41 +642,48 @@ def batch_predict(
         
         # 转换为张量并预测
         image_tensor = torch.FloatTensor(image_embeddings).to(device)
-        meaning_vectors = model(image_tensor).cpu().numpy()
-    
-    # 归一化输出
-    norms = np.linalg.norm(meaning_vectors, axis=1, keepdims=True)
-    meaning_vectors = meaning_vectors / norms
+        logits = model(image_tensor).cpu().numpy()
+        
+        # 计算softmax概率
+        probabilities = np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True)
+        predicted_classes = np.argmax(probabilities, axis=1)
+        confidences = probabilities[np.arange(len(predicted_classes)), predicted_classes]
+        
+        # 解码关键词
+        keywords = label_encoder.inverse_transform(predicted_classes)
     
     inference_time = time.time() - start_time
     
     if verbose:
         print(f"批量预测完成")
-        print(f"   输出向量形状: {meaning_vectors.shape}")
-        print(f"   平均向量范数: {np.mean(norms):.4f}")
+        print(f"   平均置信度: {np.mean(confidences):.4f}")
         print(f"   推理耗时: {inference_time*1000:.2f}ms")
         print(f"   平均每个样本耗时: {inference_time*1000/len(image_embeddings):.2f}ms")
     
-    return meaning_vectors
+    # 返回结果列表
+    results = list(zip(keywords, confidences))
+    return results
 
 
 def evaluate_model(
-    model: ImageToMeaningModel,
+    model: ImageToKeywordModel,
     scaler: StandardScaler,
+    label_encoder: LabelEncoder,
     device: torch.device,
     image_embeddings: np.ndarray,
-    text_embeddings: np.ndarray,
+    keyword_labels: np.ndarray,
     verbose: bool = True
 ) -> Dict[str, float]:
     """
-    评估模型性能
+    评估模型性能（分类模型）
     
     参数:
         model: 模型实例
         scaler: 数据标准化器
+        label_encoder: 标签编码器
         device: 计算设备
         image_embeddings: 测试图片向量
-        text_embeddings: 测试文字向量
+        keyword_labels: 测试关键词标签
         verbose: 是否打印评估信息
     
     返回:
@@ -612,32 +694,35 @@ def evaluate_model(
     
     start_time = time.time()
     
+    # 编码关键词标签
+    encoded_labels = label_encoder.transform(keyword_labels)
+    
     # 数据标准化和预测
     model.eval()
+    all_predictions = []
+    all_confidences = []
+    
     with torch.no_grad():
         if scaler is not None:
             image_embeddings = scaler.transform(image_embeddings)
         
         image_tensor = torch.FloatTensor(image_embeddings).to(device)
-        predicted_vectors = model(image_tensor).cpu().numpy()
+        logits = model(image_tensor).cpu().numpy()
+        
+        # 计算预测结果
+        predicted_classes = np.argmax(logits, axis=1)
+        confidences = np.max(np.exp(logits) / np.sum(np.exp(logits), axis=1, keepdims=True), axis=1)
+        all_predictions.extend(predicted_classes)
+        all_confidences.extend(confidences)
     
     # 计算评估指标
-    similarities = []
-    for pred, true in zip(predicted_vectors, text_embeddings):
-        # 余弦相似度
-        sim = np.dot(pred, true) / (np.linalg.norm(pred) * np.linalg.norm(true))
-        similarities.append(sim)
-    
-    # 计算MSE损失
-    mse_loss = np.mean(np.square(predicted_vectors - text_embeddings))
+    accuracy = accuracy_score(encoded_labels, all_predictions)
+    avg_confidence = np.mean(confidences)
     
     # 计算评估指标
     eval_results = {
-        'mean_cosine_similarity': np.mean(similarities),
-        'std_cosine_similarity': np.std(similarities),
-        'max_similarity': np.max(similarities),
-        'min_similarity': np.min(similarities),
-        'mse_loss': mse_loss,
+        'accuracy': accuracy,
+        'avg_confidence': avg_confidence,
         'evaluation_time': time.time() - start_time,
         'n_samples': len(image_embeddings)
     }
@@ -646,11 +731,8 @@ def evaluate_model(
     if verbose:
         print("模型评估完成")
         print(f"   评估样本数: {eval_results['n_samples']}")
-        print(f"   平均余弦相似度: {eval_results['mean_cosine_similarity']:.4f}")
-        print(f"   余弦相似度标准差: {eval_results['std_cosine_similarity']:.4f}")
-        print(f"   最大相似度: {eval_results['max_similarity']:.4f}")
-        print(f"   最小相似度: {eval_results['min_similarity']:.4f}")
-        print(f"   MSE损失: {eval_results['mse_loss']:.6f}")
+        print(f"   准确率: {eval_results['accuracy']:.4f}")
+        print(f"   平均置信度: {eval_results['avg_confidence']:.4f}")
         print(f"   评估耗时: {eval_results['evaluation_time']:.2f}秒")
     
     return eval_results
@@ -659,7 +741,7 @@ def evaluate_model(
 def load_trained_model(
     model_path: str,
     config: Optional[ModelAConfig] = None
-) -> Tuple[Union[ImageToMeaningModel, None], Optional[Exception]]:
+) -> Tuple[Union[ImageToKeywordModel, None], Optional[Exception]]:
     """
     加载训练好的模型实例（带异常捕获，增强版）- 兼容PyTorch 2.6+
     
@@ -675,7 +757,9 @@ def load_trained_model(
         # 安全上下文管理器 + 显式关闭weights_only
         with torch.serialization.safe_globals([
             sklearn.preprocessing._data.StandardScaler,
-            StandardScaler
+            StandardScaler,
+            sklearn.preprocessing._label.LabelEncoder,
+            LabelEncoder
         ]):
             # 适配原ModelA的加载逻辑
             if config is None:
@@ -690,11 +774,12 @@ def load_trained_model(
                 config = ModelAConfig(**config_dict)
         
         # ========== 核心修复2：确保load_model函数也使用兼容参数 ==========
-        # 临时修改load_model的调用逻辑（若load_model内部仍有问题，需同步改）
-        model, scaler, device = load_model(config, model_path)  # 复用统一的加载函数
+        # 使用新的load_model函数（返回4个值）
+        model, scaler, label_encoder, device = load_model(config, model_path)
         
         # 为模型添加必要属性
         model.scaler = scaler
+        model.label_encoder = label_encoder
         model.device = device
         
         return model, None
@@ -702,7 +787,7 @@ def load_trained_model(
         logger.error(f"模型加载失败: {str(e)}")
         return None, e
 
-def get_model_training_status(model: ImageToMeaningModel) -> Tuple[bool, Optional[Exception]]:
+def get_model_training_status(model: ImageToKeywordModel) -> Tuple[bool, Optional[Exception]]:
     """
     安全获取模型的训练状态
     
@@ -725,7 +810,7 @@ def get_model_training_status(model: ImageToMeaningModel) -> Tuple[bool, Optiona
 
 
 def set_model_training_status(
-    model: ImageToMeaningModel,
+    model: ImageToKeywordModel,
     is_trained: bool
 ) -> Tuple[bool, Optional[Exception]]:
     """
@@ -747,10 +832,11 @@ def set_model_training_status(
 
 
 def save_model_with_status(
-    model: ImageToMeaningModel,
+    model: ImageToKeywordModel,
     save_path: str,
     config: ModelAConfig,
-    scaler: Optional[StandardScaler] = None
+    scaler: Optional[StandardScaler] = None,
+    label_encoder: Optional[LabelEncoder] = None
 ) -> Tuple[bool, Optional[Exception]]:
     """
     保存包含训练状态的完整模型
@@ -760,13 +846,20 @@ def save_model_with_status(
         save_path: 模型保存路径
         config: 模型配置实例
         scaler: 数据标准化器（可选）
+        label_encoder: 标签编码器（可选）
     
     返回:
         Tuple: (保存是否成功, 异常对象/None)
     """
     try:
         # 复用核心的save_model函数，保证逻辑统一
-        save_model(model, scaler or getattr(model, 'scaler', None), config, save_path)
+        save_model(
+            model, 
+            scaler or getattr(model, 'scaler', None), 
+            label_encoder or getattr(model, 'label_encoder', None), 
+            config, 
+            save_path
+        )
         return True, None
     except Exception as e:
         logger.error(f"模型保存失败: {str(e)}")
@@ -855,7 +948,7 @@ def fix_model_training_status(
 
 
 def test_model_prediction(
-    model: ImageToMeaningModel,
+    model: ImageToKeywordModel,
     test_vector: Optional[np.ndarray] = None,
     verbose: bool = False
 ) -> Dict[str, Any]:
@@ -870,17 +963,17 @@ def test_model_prediction(
     返回:
         Dict: 预测结果信息
             - input_dim: int 输入维度
-            - output_dim: int 输出维度
-            - output_norm: float 输出向量范数
             - prediction_success: bool 预测是否成功
+            - keyword: str 预测关键词
+            - confidence: float 置信度
             - inference_time: float 推理耗时(秒)
             - error: str 错误信息（若有）
     """
     result = {
         "input_dim": None,
-        "output_dim": None,
-        "output_norm": None,
         "prediction_success": False,
+        "keyword": None,
+        "confidence": None,
         "inference_time": 0.0,
         "error": None
     }
@@ -895,20 +988,20 @@ def test_model_prediction(
         
         # 执行预测（复用核心的predict_single函数）
         start_time = time.time()
-        meaning_vector = predict_single(
-            model, model.scaler, model.device, 
+        keyword, confidence = predict_single(
+            model, model.scaler, model.label_encoder, model.device, 
             test_vector, verbose=False
         )
         inference_time = time.time() - start_time
         
         # 填充结果
-        result["output_dim"] = len(meaning_vector)
-        result["output_norm"] = float(np.linalg.norm(meaning_vector))
+        result["keyword"] = keyword
+        result["confidence"] = confidence
         result["inference_time"] = inference_time
         result["prediction_success"] = True
         
         if verbose:
-            print(f"预测完成 - 输入维度: {result['input_dim']}, 输出维度: {result['output_dim']}, 耗时: {inference_time:.4f}秒")
+            print(f"预测完成 - 输入维度: {result['input_dim']}, 关键词: {keyword}, 置信度: {confidence:.4f}, 耗时: {inference_time:.4f}秒")
         
     except Exception as e:
         result["error"] = f"预测失败: {str(e)}\n{traceback.format_exc()}"
@@ -1048,43 +1141,43 @@ def batch_fix_model_status(
 # ============================ 完整流程与示例 ============================
 def run_model_pipeline(
     image_embeddings: np.ndarray,
-    text_embeddings: np.ndarray,
+    keyword_labels: np.ndarray,
     config: ModelAConfig,
     random_seed: Optional[int] = 42
 ):
     """
-    运行完整的模型训练-评估-预测流程
+    运行完整的模型训练-评估-预测流程（分类模型）
     
     参数:
         image_embeddings: 图片向量数组
-        text_embeddings: 文字向量数组
+        keyword_labels: 关键词标签数组
         config: 模型配置
         random_seed: 随机种子
     """
     # 1. 训练模型
-    model, train_history, scaler = train_model(
-        image_embeddings, text_embeddings, config, random_seed
+    model, train_history, scaler, label_encoder = train_model(
+        image_embeddings, keyword_labels, config, random_seed
     )
     
     # 2. 保存最终模型
-    save_model(model, scaler, config)
+    save_model(model, scaler, label_encoder, config)
     
     # 3. 评估模型（使用测试集数据）
     n_test = int(config.test_split * len(image_embeddings))
     eval_results = evaluate_model(
-        model, scaler, next(model.parameters()).device,
-        image_embeddings[-n_test:], text_embeddings[-n_test:]
+        model, scaler, label_encoder, next(model.parameters()).device,
+        image_embeddings[-n_test:], keyword_labels[-n_test:]
     )
     
     # 4. 单样本预测示例
     single_pred = predict_single(
-        model, scaler, next(model.parameters()).device,
+        model, scaler, label_encoder, next(model.parameters()).device,
         image_embeddings[0]
     )
     
     # 5. 批量预测示例
     batch_preds = batch_predict(
-        model, scaler, next(model.parameters()).device,
+        model, scaler, label_encoder, next(model.parameters()).device,
         image_embeddings[:10]
     )
     
@@ -1101,21 +1194,22 @@ def main():
     # 示例配置
     custom_config = ModelAConfig(
         input_dim=512,
-        output_dim=1024,
+        hidden_dims=(512, 256, 128),
+        num_classes=9,
         epochs=10,
         batch_size=16,
         print_every_n_epochs=2,
-        model_path="data/models/custom_model_a.pth"
+        model_path="model/custom_model_a.pth"
     )
     
     # 准备示例数据
-    n_samples = 1000
+    n_samples = 100
     image_embeds = np.random.randn(n_samples, custom_config.input_dim)
-    text_embeds = np.random.randn(n_samples, custom_config.output_dim)
+    keyword_labels = np.random.choice(custom_config.keywords, n_samples)
     
     # 1. 运行完整训练流程
     print("=== 运行完整训练流程 ===")
-    pipeline_results = run_model_pipeline(image_embeds, text_embeds, custom_config)
+    pipeline_results = run_model_pipeline(image_embeds, keyword_labels, custom_config)
     
     # 2. 单模型状态修复示例
     print("\n=== 单模型状态修复示例 ===")
@@ -1137,7 +1231,7 @@ def main():
     # 4. 批量修复示例（模拟多个模型）
     print("\n=== 批量修复示例 ===")
     batch_result = batch_fix_model_status(
-        model_paths=[custom_config.model_path, "data/models/model_a_v2.pth"],
+        model_paths=[custom_config.model_path, "model/model_a_v2.pth"],
         target_status=True,
         config=custom_config
     )

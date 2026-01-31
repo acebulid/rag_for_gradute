@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-模型操作脚本 - 调用model_function演示模型功能
+模型操作脚本 - 调用model_function训练图片到关键词分类模型
 注意：本文件只包含主函数，不创建新函数
 """
 
@@ -8,21 +8,21 @@ import sys
 import traceback
 import numpy as np
 from pathlib import Path
+import json
 import torch
 import sklearn
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 
-# ========== 新增：修复PyTorch 2.6+的安全加载问题 ==========
-# 注册安全全局对象
+# ========== 修复：仅保留有效的安全全局对象注册 ==========
+# 注册安全全局对象（移除无效的DEFAULT_LOAD_WEIGHTS_ONLY设置）
 try:
     if hasattr(torch.serialization, 'add_safe_globals'):
         torch.serialization.add_safe_globals([
             sklearn.preprocessing._data.StandardScaler,
-            StandardScaler
+            StandardScaler,
+            sklearn.preprocessing._label.LabelEncoder,
+            LabelEncoder
         ])
-    # 全局设置weights_only默认值（备选方案）
-    import torch.serialization
-    torch.serialization.DEFAULT_LOAD_WEIGHTS_ONLY = False
 except Exception as e:
     print(f"安全全局注册警告: {e}")
 
@@ -33,24 +33,87 @@ sys.path.insert(0, str(project_root))
 # 导入model_function中的现有函数
 from function.model_function import (
     ModelAConfig,
-    create_model_instance,
     train_model,
     save_model,
     load_model,
     predict_single,
-    batch_predict,
-    evaluate_model,
-    fix_model_training_status,
-    verify_model_fix
+    batch_predict
 )
+
+
+def load_training_data():
+    """
+    从database_data.json加载训练数据
+    返回: (image_embeddings, keyword_labels)
+    """
+    print("加载训练数据...")
+    
+    # 加载database_data.json
+    data_path = Path("data/processed/database_data.json")
+    if not data_path.exists():
+        print(f"错误: 数据文件不存在: {data_path}")
+        return None, None
+    
+    with open(data_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    
+    # 获取章节信息
+    chapters = data.get('chapters', [])
+    if not chapters:
+        print("错误: 没有找到章节数据")
+        return None, None
+    
+    # 收集图片向量和关键词标签
+    image_embeddings = []
+    keyword_labels = []
+    
+    print(f"找到 {len(chapters)} 个章节")
+    
+    # 为每个章节的图片生成向量
+    for chapter in chapters:
+        chapter_title = chapter.get('title', '')
+        image_embeddings_data = chapter.get('image_embeddings', [])
+        
+        print(f"  处理章节: {chapter_title}, 图片向量数量: {len(image_embeddings_data)}")
+        
+        # 使用真实的图片向量
+        for image_data in image_embeddings_data:
+            image_embedding = image_data.get('embedding', [])
+            if not image_embedding:
+                print(f"    警告: 图片向量为空，跳过")
+                continue
+            
+            # 确保向量是numpy数组
+            image_vector = np.array(image_embedding, dtype=np.float32)
+            
+            # 归一化向量
+            norm = np.linalg.norm(image_vector)
+            if norm > 0:
+                image_vector = image_vector / norm
+            
+            image_embeddings.append(image_vector)
+            keyword_labels.append(chapter_title)
+    
+    if not image_embeddings:
+        print("错误: 没有生成任何训练数据")
+        return None, None
+    
+    image_embeddings = np.array(image_embeddings)
+    
+    print(f"训练数据加载完成")
+    print(f"  总样本数: {len(image_embeddings)}")
+    print(f"  输入维度: {image_embeddings.shape[1]}")
+    print(f"  关键词类别: {set(keyword_labels)}")
+    
+    return image_embeddings, keyword_labels
 
 
 def main():
     """
-    主函数：演示模型A的完整功能
+    主函数：训练图片到关键词分类模型
     """
     print("=" * 70)
-    print("模型A功能演示")
+    print("图片到关键词分类模型训练")
     print("=" * 70)
     
     # 1. 创建模型配置
@@ -59,145 +122,225 @@ def main():
     model_dir.mkdir(exist_ok=True)
     
     config = ModelAConfig(
-        input_dim=512,          
-        output_dim=1024,        
-        epochs=5,               
-        batch_size=8,           
-        print_every_n_epochs=1,
+        input_dim=512,           # CLIP图片向量维度（512维）
+        hidden_dims=(256, 128, 64),  # 隐藏层维度相应调整
+        num_classes=9,           # 9个关键词类别
+        epochs=50,               # 训练轮数
+        batch_size=16,           # 批次大小
+        print_every_n_epochs=5,  # 每5个epoch打印一次
         model_path="model/model_a.pth",
         config_path="model/model_a_config.json",
-        scaler_path="model/model_a_scaler.pkl"
+        scaler_path="model/model_a_scaler.pkl",
+        label_encoder_path="model/model_a_label_encoder.pkl"
     )
     
-    # 2. 创建示例数据（演示用）
-    n_samples = 100
-    image_embeddings = np.random.randn(n_samples, config.input_dim).astype(np.float32)
-    text_embeddings = np.random.randn(n_samples, config.output_dim).astype(np.float32)
+    # 2. 加载训练数据
+    print("\n1. 加载训练数据...")
+    image_embeddings, keyword_labels = load_training_data()
     
-    # 归一化数据
-    for i in range(n_samples):
-        image_embeddings[i] = image_embeddings[i] / np.linalg.norm(image_embeddings[i])
-        text_embeddings[i] = text_embeddings[i] / np.linalg.norm(text_embeddings[i])
+    if image_embeddings is None or keyword_labels is None:
+        print("训练数据加载失败，退出")
+        return
     
     # 3. 训练模型
-    print("\n1. 训练模型...")
+    print("\n2. 训练模型...")
     try:
-        model, train_history, scaler = train_model(
+        model, train_history, scaler, label_encoder = train_model(
             image_embeddings=image_embeddings,
-            text_embeddings=text_embeddings,
+            keyword_labels=keyword_labels,
             config=config,
             random_seed=42,
-            verbose=False  # 关闭训练过程的详细打印
+            verbose=True  # 显示训练过程
         )
-        print(f"   训练完成 | 最佳验证损失: {train_history['best_val_loss']:.6f} | 耗时: {train_history['training_time']:.2f}s")
+        
+        print(f"   训练完成")
+        print(f"   最佳验证准确率: {train_history['best_val_accuracy']:.4f}")
+        print(f"   最终训练准确率: {train_history['train_accuracies'][-1]:.4f}")
+        print(f"   最终验证准确率: {train_history['val_accuracies'][-1]:.4f}")
+        print(f"   训练耗时: {train_history['training_time']:.2f}s")
+        
     except Exception as e:
         print(f"   训练失败: {e}")
+        print(f"   详细错误栈: {traceback.format_exc()}")
         return
     
     # 4. 保存模型
-    print("\n2. 保存模型...")
+    print("\n3. 保存模型...")
     try:
-        save_model(model, scaler, config)
+        save_model(model, scaler, label_encoder, config)
         print(f"   模型已保存: {config.model_path}")
-        
-        # 同时保存配置文件和scaler
-        config_path = "model/model_a_config.json"
-        scaler_path = "model/model_a_scaler.pkl"
-        
-        # 保存配置
-        import json
-        config_dict = {
-            "input_dim": config.input_dim,
-            "output_dim": config.output_dim,
-            "hidden_dims": config.hidden_dims,
-            "learning_rate": config.learning_rate,
-            "epochs": config.epochs,
-            "batch_size": config.batch_size,
-            "model_path": config.model_path
-        }
-        with open(config_path, 'w') as f:
-            json.dump(config_dict, f, indent=2)
-        print(f"   配置文件已保存: {config_path}")
-        
-        # 保存scaler
-        import pickle
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(scaler, f)
-        print(f"   Scaler已保存: {scaler_path}")
+        print(f"   配置文件已保存: {config.config_path}")
+        print(f"   Scaler已保存: {config.scaler_path}")
+        print(f"   标签编码器已保存: {config.label_encoder_path}")
         
     except Exception as e:
         print(f"   保存失败: {e}")
+        return
     
     # 5. 加载模型并测试预测
-    print("\n3. 加载模型并预测...")
+    print("\n4. 加载模型并测试预测...")
     try:
-        loaded_model, loaded_scaler, device = load_model(config)
+        loaded_model, loaded_scaler, loaded_label_encoder, device = load_model(config)
         
-        # 单样本预测
-        test_image = np.random.randn(config.input_dim).astype(np.float32)
-        test_image = test_image / np.linalg.norm(test_image)
-        meaning_vector = predict_single(loaded_model, loaded_scaler, device, test_image, verbose=False)
+        print(f"   模型加载成功")
+        print(f"   设备: {device}")
+        print(f"   关键词类别: {loaded_label_encoder.classes_}")
         
-        # 批量预测
-        batch_images = np.random.randn(5, config.input_dim).astype(np.float32)
-        for i in range(5):
-            batch_images[i] = batch_images[i] / np.linalg.norm(batch_images[i])
-        batch_vectors = batch_predict(loaded_model, loaded_scaler, device, batch_images, verbose=False)
+        # 单样本预测测试
+        print(f"\n   单样本预测测试:")
+        test_image = image_embeddings[0]  # 使用第一个训练样本
+        keyword, confidence = predict_single(
+            loaded_model, loaded_scaler, loaded_label_encoder, device, 
+            test_image, verbose=True
+        )
         
-        print(f"   加载成功 | 设备: {device} | 单样本输出维度: {len(meaning_vector)} | 批量输出形状: {batch_vectors.shape}")
+        # 批量预测测试
+        print(f"\n   批量预测测试:")
+        batch_images = image_embeddings[:5]  # 使用前5个训练样本
+        batch_results = batch_predict(
+            loaded_model, loaded_scaler, loaded_label_encoder, device,
+            batch_images, verbose=True
+        )
+        
+        print(f"\n   批量预测结果:")
+        for i, (keyword, confidence) in enumerate(batch_results, 1):
+            print(f"      [{i}] 关键词: {keyword}, 置信度: {confidence:.4f}")
+        
     except Exception as e:
         print(f"   加载/预测失败: {e}")
-    
-    # 6. 模型状态修复和验证
-    print("\n4. 模型状态修复与验证...")
-    try:
-        # 修复模型状态
-        fix_result = fix_model_training_status(config.model_path, True, config)
-        if fix_result["success"]:
-            # ========== 关键修改1：修正参数传递顺序 ==========
-            # 准备测试向量（和步骤5中用的测试向量一致）
-            test_vector = np.random.randn(config.input_dim).astype(np.float32)
-            test_vector = test_vector / np.linalg.norm(test_vector)
-            
-            # ========== 关键修改2：打开verbose=True，查看详细验证日志 ==========
-            verify_result = verify_model_fix(
-                model_path=config.model_path,
-                test_vector=test_vector,  # 正确传递测试向量
-                config=config,            # 正确传递config参数
-                verbose=True              # 开启详细日志
-            )
-            
-            # 打印完整的验证结果（便于调试）
-            print(f"\n   完整验证结果:")
-            print(f"      - 模型路径: {verify_result['model_path']}")
-            print(f"      - 训练状态: {verify_result['current_training_status']}")
-            print(f"      - 预测成功: {verify_result['prediction_test'].get('prediction_success', False)}")
-            print(f"      - 验证成功: {verify_result['verification_success']}")
-            if verify_result['error']:
-                print(f"      - 错误信息: {verify_result['error']}")
-            
-            print(f"\n   修复成功 | 验证{'通过' if verify_result['verification_success'] else '失败'}")
-        else:
-            print(f"   修复失败: {fix_result.get('error', '未知错误')}")
-    except Exception as e:
-        print(f"   状态修复/验证失败: {e}")
         print(f"   详细错误栈: {traceback.format_exc()}")
     
     print("\n" + "=" * 70)
-    print("模型演示完成")
+    print("模型训练完成")
     print("=" * 70)
+    
+    # 6. 提供使用说明
+    print("\n使用说明:")
+    print("1. 重新训练模型: python scripts/do_model.py")
+    print("2. 测试模型预测: python scripts/do_model.py --test")
+    print("3. 查看模型信息: python scripts/do_model.py --info")
+
+
+def test_model():
+    """
+    测试已训练的模型
+    """
+    print("=" * 70)
+    print("测试已训练的模型")
+    print("=" * 70)
+    
+    # 加载模型配置
+    config = ModelAConfig()
+    
+    # 加载模型
+    try:
+        model, scaler, label_encoder, device = load_model(config)
+        
+        print(f"模型加载成功")
+        print(f"设备: {device}")
+        print(f"关键词类别: {label_encoder.classes_}")
+        print(f"类别数量: {len(label_encoder.classes_)}")
+        
+        # 生成随机测试向量
+        print(f"\n随机测试:")
+        for i in range(3):
+            test_vector = np.random.randn(config.input_dim).astype(np.float32)
+            test_vector = test_vector / np.linalg.norm(test_vector)
+            
+            keyword, confidence = predict_single(
+                model, scaler, label_encoder, device, test_vector, verbose=True
+            )
+        
+        # 测试真实图片向量（如果有）
+        print(f"\n真实数据测试:")
+        image_embeddings, keyword_labels = load_training_data()
+        if image_embeddings is not None and len(image_embeddings) > 0:
+            # 随机选择5个样本
+            indices = np.random.choice(len(image_embeddings), min(5, len(image_embeddings)), replace=False)
+            for idx in indices:
+                test_vector = image_embeddings[idx]
+                true_keyword = keyword_labels[idx]
+                
+                keyword, confidence = predict_single(
+                    model, scaler, label_encoder, device, test_vector, verbose=True
+                )
+                print(f"   真实关键词: {true_keyword}, 预测关键词: {keyword}, 置信度: {confidence:.4f}")
+        
+    except Exception as e:
+        print(f"测试失败: {e}")
+        print(f"详细错误栈: {traceback.format_exc()}")
+
+
+def show_model_info():
+    """
+    显示模型信息
+    """
+    print("=" * 70)
+    print("模型信息")
+    print("=" * 70)
+    
+    # 加载模型配置
+    config = ModelAConfig()
+    
+    # ========== 新增：多文件存在性校验 ==========
+    required_files = [
+        (config.model_path, "模型文件"),
+        (config.config_path, "配置文件"),
+        (config.scaler_path, "Scaler文件"),
+        (config.label_encoder_path, "标签编码器文件")
+    ]
+    
+    for file_path, file_desc in required_files:
+        path = Path(file_path)
+        if not path.exists():
+            print(f"错误: {file_desc}不存在: {path}")
+            return
+    
+    try:
+        # 加载模型
+        model, scaler, label_encoder, device = load_model(config)
+        
+        print(f"模型文件: {config.model_path}")
+        print(f"配置文件: {config.config_path}")
+        print(f"Scaler文件: {config.scaler_path}")
+        print(f"标签编码器文件: {config.label_encoder_path}")
+        print(f"计算设备: {device}")
+        print(f"输入维度: {config.input_dim}")
+        print(f"隐藏层维度: {config.hidden_dims}")
+        print(f"输出类别数: {config.num_classes}")
+        print(f"关键词类别: {label_encoder.classes_}")
+        
+        # 检查模型参数
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"总参数数量: {total_params:,}")
+        print(f"可训练参数数量: {trainable_params:,}")
+        
+    except Exception as e:
+        print(f"加载模型信息失败: {e}")
+
+
+def parse_arguments():
+    """
+    解析命令行参数
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='模型操作脚本')
+    parser.add_argument('--test', action='store_true', help='测试已训练的模型')
+    parser.add_argument('--info', action='store_true', help='显示模型信息')
+    
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    # 修复dataclass导入问题
-    if sys.version_info >= (3, 7):
-        from dataclasses import dataclass
+    # ========== 修复：删除重复的dataclass装饰器 ==========
+    # 直接解析命令行参数，无需重新装饰ModelAConfig
+    args = parse_arguments()
+    
+    if args.test:
+        test_model()
+    elif args.info:
+        show_model_info()
     else:
-        def dataclass(cls):
-            return cls
-    
-    # 重新应用dataclass装饰器
-    from function.model_function import ModelAConfig as OriginalModelAConfig
-    globals()['ModelAConfig'] = dataclass(OriginalModelAConfig)
-    
-    main()
+        main()

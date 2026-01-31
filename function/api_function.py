@@ -7,11 +7,93 @@ import os
 import aiohttp
 import json
 import asyncio
+import threading
 from typing import List, Dict, Any, Optional
 import logging
+import numpy as np
+import torch
+from PIL import Image
+from transformers import AutoModel, AutoProcessor  # 关键：替换为AutoProcessor
 
 # 配置日志
 logger = logging.getLogger(__name__)
+
+# ========== 全局CLIP模型配置（优化：支持图文双输入） ==========
+_CLIP_PROCESSOR = None  # 改名：从_CLIP_IMAGE_PROCESSOR改为_CLIP_PROCESSOR（适配图文）
+_CLIP_MODEL = None
+_CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+_TARGET_EMBEDDING_DIM = 512
+_CLIP_MODEL_LOCK = threading.Lock()
+
+def _init_clip_model():
+    """初始化CLIP模型（单例，支持图文双输入，避免重复加载）"""
+    global _CLIP_PROCESSOR, _CLIP_MODEL
+    if _CLIP_PROCESSOR is None or _CLIP_MODEL is None:
+        with _CLIP_MODEL_LOCK:
+            if _CLIP_PROCESSOR is None or _CLIP_MODEL is None:
+                try:
+                    logger.info(f"正在加载CLIP模型：{_CLIP_MODEL_NAME}")
+                    # 配置国内镜像，提升下载速度
+                    import os
+                    if not os.getenv("HF_ENDPOINT"):
+                        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+                    # 关键：使用AutoProcessor，支持同时预处理图片和文本
+                    _CLIP_PROCESSOR = AutoProcessor.from_pretrained(_CLIP_MODEL_NAME)
+                    _CLIP_MODEL = AutoModel.from_pretrained(_CLIP_MODEL_NAME)
+                    _CLIP_MODEL.eval()
+                    logger.info("CLIP模型加载完成（支持图文双输入）")
+                except Exception as e:
+                    logger.error(f"加载CLIP模型失败：{e}")
+                    raise e
+
+def _extract_clip_image_feature(image_path: str, text_label: str = "default image") -> np.ndarray:
+    """
+    同步提取CLIP图片特征（优化版：补全文本标签输入，解决input_ids报错，提升向量质量）
+    
+    参数:
+        image_path: 图片文件路径
+        text_label: 图片对应的文本标签（如章节名"校门"）
+    
+    返回:
+        np.ndarray: 512维CLIP图片特征向量
+    """
+    try:
+        # 1. 初始化CLIP模型
+        _init_clip_model()
+        
+        # 2. 读取并预处理图片（转为RGB，避免格式错误）
+        image = Image.open(image_path).convert("RGB")
+        
+        # 3. 关键：用AutoProcessor同时预处理图片和文本标签（解决input_ids报错）
+        # CLIP会自动生成图片的pixel_values和文本的input_ids/attention_mask
+        inputs = _CLIP_PROCESSOR(
+            images=image,
+            text=text_label,  # 传入图片对应的章节标签，补全文本输入
+            return_tensors="pt",
+            padding=True,
+            truncation=True
+        )
+        
+        # 4. 提取图文融合特征（无梯度计算，提升速度）
+        with torch.no_grad():
+            outputs = _CLIP_MODEL(** inputs)
+            # 提取图像特征（image_embeds：纯图像特征；text_embeds：纯文本特征；可按需选择）
+            # 方案A：用纯图像特征（保持原有逻辑，仅解决报错）
+            image_feature = outputs.image_embeds.squeeze().numpy()
+            # 方案B：用图文融合特征（推荐，语义更精准，取两者均值）
+            # text_feature = outputs.text_embeds.squeeze().numpy()
+            # image_feature = (image_feature + text_feature) / 2
+        
+        # 5. 归一化（对齐向量格式，避免数值溢出）
+        image_feature = image_feature / np.linalg.norm(image_feature)
+        
+        return image_feature.astype(np.float32)
+    except FileNotFoundError:
+        logger.error(f"提取CLIP图片特征失败：图片文件不存在 {image_path}")
+        return np.array([])
+    except Exception as e:
+        logger.error(f"提取CLIP图片特征失败：{e}")
+        return np.array([])
 
 # ========== 配置 ==========
 class OllamaConfig:
@@ -71,6 +153,41 @@ class OllamaService:
                     return []
         except Exception as e:
             logger.error(f"生成嵌入异常: {e}")
+            return []
+    
+    async def generate_image_embedding(self, image_path: str, model_name: str = "bge-m3", text_label: str = "default image") -> List[float]:
+        """
+        生成图像嵌入向量（优化版：传入文本标签，图文双输入生成优质向量）
+        
+        参数:
+            image_path: 图像文件路径
+            model_name: 模型名称（保留参数，保持接口兼容）
+            text_label: 图片对应的文本标签（新增，用于补全CLIP文本输入）
+        
+        返回:
+            List[float]: 512维图像嵌入向量（CLIP原始维度）
+        """
+        try:
+            # 1. 同步提取CLIP图文特征（包装为异步，避免阻塞事件循环，传入文本标签）
+            clip_feature = await asyncio.get_event_loop().run_in_executor(
+                None, _extract_clip_image_feature, image_path, text_label  # 新增传入text_label
+            )
+            
+            if clip_feature.size == 0:
+                logger.error("CLIP图片特征提取结果为空")
+                return []
+            
+            # 2. 直接返回512维向量（不进行维度扩展）
+            # 归一化，保证向量规范性
+            clip_feature = clip_feature / np.linalg.norm(clip_feature)
+            
+            # 3. 转换为List[float]返回，符合接口要求
+            result_embedding = clip_feature.tolist()
+            logger.debug(f"生成512维图片向量成功（标签：{text_label}），维度：{len(result_embedding)}")
+            
+            return result_embedding
+        except Exception as e:
+            logger.error(f"生成图片嵌入向量异常: {e}")
             return []
     
     async def generate_text(self, prompt: str, model: Optional[str] = None) -> str:
@@ -202,8 +319,12 @@ class OllamaService:
         if len(keywords) > 5:
             logger.debug(f"关键词数量超过5个，截断前5个，原列表：{keywords}")
         
-        logger.debug(f"最终提取关键词: {final_keywords}")
-        return final_keywords
+        # 关键修改：过滤掉"首都师范大学"这个词
+        filtered_keywords = [kw for kw in final_keywords if kw != "首都师范大学"]
+        
+        logger.debug(f"过滤前关键词: {final_keywords}")
+        logger.debug(f"过滤后关键词: {filtered_keywords}")
+        return filtered_keywords
     
     async def batch_generate_embeddings(self, texts: List[str]) -> List[List[float]]:
         """
@@ -273,6 +394,22 @@ async def generate_embedding(text: str) -> List[float]:
     """
     async with OllamaService() as service:
         return await service.generate_embedding(text)
+
+
+async def generate_image_embedding(image_path: str, model_name: str = "bge-m3", text_label: str = "default image") -> List[float]:
+    """
+    生成图像嵌入向量（简化接口）
+    
+    参数:
+        image_path: 图像文件路径
+        model_name: 模型名称，默认使用bge-m3
+        text_label: 图片对应的文本标签（新增，用于补全CLIP文本输入）
+    
+    返回:
+        List[float]: 图像嵌入向量
+    """
+    async with OllamaService() as service:
+        return await service.generate_image_embedding(image_path, model_name, text_label)
 
 
 async def generate_text(prompt: str, model: Optional[str] = None) -> str:

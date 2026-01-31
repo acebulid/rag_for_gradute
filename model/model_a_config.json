@@ -1,13 +1,34 @@
 {
   "input_dim": 512,
-  "output_dim": 1024,
   "hidden_dims": [
-    1024,
-    1024,
-    1024
+    256,
+    128,
+    64
   ],
+  "num_classes": 9,
   "learning_rate": 0.001,
-  "epochs": 5,
-  "batch_size": 8,
-  "model_path": "model/model_a.pth"
+  "batch_size": 16,
+  "epochs": 50,
+  "dropout_rate": 0.3,
+  "weight_decay": 1e-05,
+  "validation_split": 0.2,
+  "test_split": 0.1,
+  "model_path": "model/model_a.pth",
+  "config_path": "model/model_a_config.json",
+  "scaler_path": "model/model_a_scaler.pkl",
+  "label_encoder_path": "model/model_a_label_encoder.pkl",
+  "print_every_n_epochs": 5,
+  "save_checkpoints": true,
+  "checkpoint_dir": "model/checkpoints",
+  "keywords": [
+    "\u6821\u95e8",
+    "\u6821\u8bad\u77f3",
+    "\u4e3b\u697c",
+    "\u56fe\u4e66\u9986",
+    "\u7406\u79d1\u697c",
+    "\u5b66\u751f\u6d3b\u52a8\u4e2d\u5fc3\uff08\u8865\u5145\u7248\uff09",
+    "\u64cd\u573a",
+    "\u98df\u5802",
+    "\u5927\u6210\u5e7f\u573a"
+  ]
 }

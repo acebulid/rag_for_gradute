@@ -65,6 +65,7 @@ class QueryHistory(Base):
     __tablename__ = "query_history"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    session_id = Column(String, nullable=True)  # 会话ID，用于关联多轮对话
     query_text = Column(Text, nullable=True)
     query_image_path = Column(String, nullable=True)
     query_type = Column(String, nullable=False)  # "text", "image", "hybrid"
@@ -75,7 +76,7 @@ class QueryHistory(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     
     def __repr__(self):
-        return f"<QueryHistory(id={self.id}, type={self.query_type})>"
+        return f"<QueryHistory(id={self.id}, session={self.session_id}, type={self.query_type})>"
 
 
 # 导出所有模型
